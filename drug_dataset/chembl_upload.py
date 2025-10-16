@@ -1,20 +1,13 @@
 import os
-print('hi')
+import io
+import json
 import requests
 import pandas as pd
 from sqlalchemy import create_engine, text
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from jsonschema import validate
-import json
+import psycopg2
 
-
-'''
-export DB_USER="postgres"
-export DB_PASS="AzuleneLabs_2026"
-export DB_HOST="azulene-1.cizeysmsgxmm.us-east-1.rds.amazonaws.com"
-export DB_NAME="postgres"
-export DB_PORT=5432
-'''
 
 # --- CONFIG ---
 DB_USER = os.getenv("DB_USER")
@@ -31,70 +24,87 @@ LIMIT = BATCH_SIZE
 OFFSET = 0
 
 # --- Connect to PostgreSQL ---
+
+MAX_WORKERS = 5        # threads for parallel API fetch
+TABLE_NAME = "chembl_molecules"
+
+# --- Connect to PostgreSQL ---
 conn_str = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 engine = create_engine(conn_str)
 
 # --- Create table schema if not exists ---
+create_table_sql = f"""
+DROP TABLE IF EXISTS {TABLE_NAME};
 
-
-create_table_sql = """
-DROP TABLE IF EXISTS chembl_molecules;
-
-CREATE TABLE IF NOT EXISTS chembl_molecules (
+CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     molecule_chembl_id TEXT PRIMARY KEY,
     molecule_data JSONB
-
-   
 );
 """
+
 with engine.begin() as conn:
     conn.execute(text(create_table_sql))
     #conn.commit()
 
 
-# --- Fetch and insert data ---
-print(f"Fetching {SAMPLE_SIZE} molecules from ChEMBL API...")
+# --- COPY INSERT function ---
+def copy_insert(engine, df, table_name):
+    """Efficiently bulk insert a pandas DataFrame into PostgreSQL using COPY."""
+    buffer = io.StringIO()
+    df.to_csv(buffer, index=False, header=False, sep='\t')
+    buffer.seek(0)
 
-inserted = 0
-pbar = tqdm(total=SAMPLE_SIZE, desc="Downloading & inserting")
+    conn = engine.raw_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.copy_expert(f"""
+            COPY {table_name} (molecule_chembl_id, molecule_data)
+            FROM STDIN WITH (FORMAT CSV, DELIMITER E'\t')
+        """, buffer)
+        conn.commit()
+    except Exception as e:
+        print("⚠️ COPY failed, rolling back:", e)
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
-while inserted < SAMPLE_SIZE:
-    print("more hi")
-    params = {"limit": LIMIT, "offset": OFFSET}
+# --- Fetch molecules in parallel ---
+def fetch_and_insert(offset):
+    """Fetch a batch from the ChEMBL API and insert into PostgreSQL."""
+    params = {"limit": LIMIT, "offset": offset}
     resp = requests.get(API_URL, params=params)
     resp.raise_for_status()
     data = resp.json()
 
     if "molecules" not in data:
-        print("Unexpected response")
-        break
+        print(f"Unexpected response at offset {offset}: {data}")
+        return 0
+
     molecules = data["molecules"]
-    print(molecules[0]["molecule_chembl_id"])
+    df = pd.DataFrame([
+        {"molecule_chembl_id": m["molecule_chembl_id"], "molecule_data": json.dumps(m)}
+        for m in molecules
+    ])
+    copy_insert(engine, df, TABLE_NAME)
+    return len(df)
 
-    
-    batch_size = 1000
-    bi = 0
+# --- Main execution ---
+print(f"🚀 Starting ChEMBL ingestion ({SAMPLE_SIZE:,} target molecules)...")
+offsets = range(0, SAMPLE_SIZE, LIMIT)
+inserted_total = 0
 
-    with engine.begin() as conn:
-        for i in range(0, len(molecules), batch_size):
-            print(f"batch {bi}")
-            bi += 1
-            batch = molecules[i:i + batch_size]
-            conn.execute(
-                text("""
-                    INSERT INTO chembl_molecules (molecule_chembl_id, molecule_data)
-                    VALUES (:chembl_id, :data)
-                    ON CONFLICT (molecule_chembl_id) DO NOTHING
-                """),
-                [
-                    {"chembl_id": m["molecule_chembl_id"], "data": json.dumps(m)}
-                    for m in batch
-                ]
-            )
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = [executor.submit(fetch_and_insert, offset) for offset in offsets]
 
-    inserted += len(molecules)
-    OFFSET += LIMIT
-    pbar.update(len(molecules))
+    with tqdm(total=SAMPLE_SIZE, desc="Downloading & inserting", unit="mol") as pbar:
+        for f in as_completed(futures):
+            try:
+                inserted = f.result()
+                inserted_total += inserted
+                pbar.update(inserted)
+            except Exception as e:
+                print(f"⚠️ Error during batch insert: {e}")
 
-pbar.close()
-print("✅ Done! Molecules loaded into RDS.")
+print(f"✅ Done! {inserted_total:,} molecules successfully loaded into RDS.")
