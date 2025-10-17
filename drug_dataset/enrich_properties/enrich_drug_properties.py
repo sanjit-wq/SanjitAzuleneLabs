@@ -6,6 +6,7 @@ from sqlalchemy import create_engine, text
 from tqdm import tqdm
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen
+import joblib
 
 # --- CONFIG ---
 DB_USER = os.getenv("DB_USER")
@@ -15,6 +16,9 @@ DB_NAME = os.getenv("DB_NAME")
 DB_PORT = os.getenv("DB_PORT", 5432)
 
 BATCH_SIZE = 1000
+
+permeability_model = joblib.load("models/permeability_rf.joblib")
+
 
 # --- Connect to PostgreSQL ---
 conn_str = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -75,8 +79,16 @@ def enrich_dataframe(df):
         hbd = Descriptors.NumHDonors(mol)
         hba = Descriptors.NumHAcceptors(mol)
 
-        # empirical regression from literature (very rough)
-        permeability = 1.5 * logp - 0.01 * psa - 0.002 * mw - 0.1 * hbd - 0.05 * hba
+        desc = [
+            mw,
+            logp,
+            psa,
+            hbd,
+            hba,
+            Descriptors.NumRotatableBonds(mol)
+    ]
+        permeability = float(permeability_model.predict([desc])[0])
+
         row["permeability"] = permeability
         row["hba"]  = hba
         row["hbd"]  = hbd
