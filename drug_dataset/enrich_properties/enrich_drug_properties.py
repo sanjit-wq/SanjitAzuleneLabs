@@ -108,6 +108,11 @@ def enrich_dataframe(df):
 
 # --- Save enriched data ---
 def save_to_postgres(df):
+    ## Make sure all metadata rows are strings
+    df["metadata"] = df["metadata"].apply(
+        lambda x: json.dumps(x) if isinstance(x, dict) else x
+    )
+    
     df.to_sql("drug_properties_enriched", engine, if_exists="replace", index=False)
     print(f"✅ Saved {len(df)} enriched rows to drug_properties_enriched table.")
 
