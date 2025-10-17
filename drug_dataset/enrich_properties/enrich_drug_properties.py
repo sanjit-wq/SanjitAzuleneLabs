@@ -60,9 +60,31 @@ def fetch_data(limit=None):
 
 # --- Enrichment Pipeline ---
 def enrich_dataframe(df):
+
+    df = df.dropna(subset=["smiles"]).copy()
+    df = df[df["smiles"].apply(lambda s: isinstance(s, str) and len(s.strip()) > 0)]
+    
     enriched = []
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching molecules"):
         smiles = row.get("smiles")
+
+        mol = Chem.MolFromSmiles(smiles)
+        logp = Descriptors.MolLogP(mol)
+        psa = Descriptors.TPSA(mol)
+        mw = Descriptors.MolWt(mol)
+        hbd = Descriptors.NumHDonors(mol)
+        hba = Descriptors.NumHAcceptors(mol)
+
+        # empirical regression from literature (very rough)
+        permeability = 1.5 * logp - 0.01 * psa - 0.002 * mw - 0.1 * hbd - 0.05 * hba
+        row["permeability"] = permeability
+        row["hba"]  = hba
+        row["hbd"]  = hbd
+        row["psa"]  = psa
+        row["molecular_weight"] = mw
+
+
+
         data_origin = {}
 
         if not smiles:
